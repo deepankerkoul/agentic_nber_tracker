@@ -1,6 +1,9 @@
+# Env files
 .env
 venv
 
-.env.example
-
+# Antigravity Files
 *.md.resolved
+
+# Logs
+*.log

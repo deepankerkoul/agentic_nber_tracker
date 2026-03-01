@@ -1,6 +1,8 @@
 import os
 import re
 import sys
+import sqlite3
+import logging
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -13,47 +15,127 @@ from src.config.settings import (
     NBER_BASE_URL, 
     NBER_API_URL, 
     START_DATE, 
-    OUTPUT_FILE_PATH,
+    OUTPUT_DIR,
+    DB_PATH,
+    LOGS_DIR,
     GEMINI_API_KEY
 )
 
+# Setup Logging
+os.makedirs(LOGS_DIR, exist_ok=True)
+date_str = datetime.now().strftime('%Y%m%d')
+exec_log_filename = os.path.join(LOGS_DIR, f"tracker_{date_str}_execution.log")
+error_log_filename = os.path.join(LOGS_DIR, f"tracker_{date_str}_error.log")
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Clear existing handlers if any
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# Execution Log Handler (Appends to daily file)
+exec_handler = logging.FileHandler(exec_log_filename, mode='a')
+exec_handler.setLevel(logging.INFO)
+exec_handler.setFormatter(formatter)
+
+# Error Log Handler (Appends to daily error file)
+err_handler = logging.FileHandler(error_log_filename, mode='a')
+err_handler.setLevel(logging.ERROR)
+err_handler.setFormatter(formatter)
+
+# Console Handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+
+logger.addHandler(exec_handler)
+logger.addHandler(err_handler)
+logger.addHandler(console_handler)
+
 if not GEMINI_API_KEY:
+    logger.error("GEMINI_API_KEY environment variable not set.")
     raise ValueError("GEMINI_API_KEY environment variable not set. Please set it via export or in a .env file.")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+def init_db():
+    """Initializes the SQLite database and creates the necessary tables."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS processed_papers (
+            url TEXT PRIMARY KEY,
+            title TEXT,
+            published_date TEXT,
+            markdown_file TEXT,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    return conn
+
+def is_paper_processed(conn, url):
+    """Checks if a paper URL already exists in the database."""
+    cursor = conn.cursor()
+    cursor.execute('SELECT 1 FROM processed_papers WHERE url = ?', (url,))
+    return cursor.fetchone() is not None
+
+def record_paper_processed(conn, url, title, date, md_file):
+    """Records a processed paper in the database."""
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO processed_papers (url, title, published_date, markdown_file)
+        VALUES (?, ?, ?, ?)
+    ''', (url, title, date, md_file))
+    conn.commit()
+
 def fetch_recent_papers():
-    """Fetches papers from the NBER Innovation Policy search API."""
+    """Fetches papers from the NBER working paper search API."""
+    logger.info("Fetching recent innovation policy papers from NBER API...")
     papers_to_process = []
     page = 1
     
     while True:
         url = NBER_API_URL.format(page)
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
+        logger.info(f"Navigating to page {page}: {url}")
         
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch NBER API page {page}: {e}", exc_info=True)
+            break
+            
         results = data.get("results", [])
         if not results:
+            logger.info("No articles found on this page. Reached the end of pagination.")
             break
             
         for paper in results:
             date_str = paper.get("displaydate", "")
             try:
+                # E.g. "January 2026" or "Jan 2026".
                 paper_date = datetime.strptime(date_str, "%B %Y")
             except ValueError:
-                print(f"Skipping paper with invalid date: {date_str}")
+                logger.warning(f"Skipping paper with invalid date format: '{date_str}'")
                 continue
             
             if paper_date >= START_DATE:
                 paper_url = NBER_BASE_URL + paper.get("url", "")
                 title = paper.get("title", "")
+                
                 papers_to_process.append({
                     "title": title,
                     "url": paper_url,
                     "date": date_str
                 })
             else:
+                logger.info(f"Encountered a paper published before {START_DATE.strftime('%B %Y')}. Halting search.")
                 return papers_to_process
                 
         page += 1
@@ -62,8 +144,14 @@ def fetch_recent_papers():
 
 def extract_paper_details(paper_url):
     """Fetches the specific paper page to extract the full text/abstract."""
-    response = requests.get(paper_url)
-    response.raise_for_status()
+    logger.info(f"Extracting details for: {paper_url}")
+    try:
+        response = requests.get(paper_url)
+        response.raise_for_status()
+    except Exception as e:
+        logger.error(f"Failed to fetch paper page {paper_url}: {e}", exc_info=True)
+        return None
+
     soup = BeautifulSoup(response.content, "html.parser")
     
     abstract_div = soup.find("div", class_="page-header__intro-inner")
@@ -80,6 +168,7 @@ def extract_paper_details(paper_url):
 
 def summarize_with_gemini(paper_info, url, title, date):
     """Uses Gemini to summarize the paper and extract metadata."""
+    logger.info(f"Summarizing paper with Gemini: {title}")
     prompt = f"""
 You are an expert academic assistant. A user wants to track working papers. I am providing you with the text extracted from a working paper's webpage.
 
@@ -101,53 +190,65 @@ Please extract the following information and output it EXACTLY in Markdown forma
 
 Ensure the output is valid Markdown.
 """
-    
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=prompt,
-    )
-    return response.text
-
-def update_markdown_file(markdown_content, file_path=OUTPUT_FILE_PATH):
-    """Appends the newly processed markdown content to the tracker file."""
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    
-    existing_urls = set()
-    if os.path.exists(file_path):
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-            urls = re.findall(r'\[.*?\]\((https://www.nber.org/papers/.*?)\)', content)
-            existing_urls = set(urls)
-            
-    url_match = re.search(r'\[.*?\]\((https://www.nber.org/papers/.*?)\)', markdown_content)
-    if url_match and url_match.group(1) in existing_urls:
-        print(f"Paper {url_match.group(1)} is already tracked. Skipping.")
-        return False
-
-    with open(file_path, "a", encoding="utf-8") as f:
-        if os.path.getsize(file_path) == 0:
-            f.write("# NBER Innovation Policy Working Papers Tracker\n\n")
-            f.write("Tracking papers published on or after Jan 1, 2026.\n\n")
-        f.write(markdown_content + "\n\n")
-        
-    return True
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        logger.error(f"Failed to summarize paper using Gemini: {e}", exc_info=True)
+        return None
 
 def main():
-    print("Fetching recent innovation policy papers...")
+    logger.info("Starting NBER Tracker script execution.")
+    conn = init_db()
+    
     papers = fetch_recent_papers()
-    print(f"Found {len(papers)} papers since {START_DATE.strftime('%b %Y')}.")
+    logger.info(f"Found {len(papers)} papers since {START_DATE.strftime('%B %Y')}.")
+    
+    if not papers:
+        logger.info("No new papers to process. Exiting.")
+        return
+        
+    # Generate a timestamp for this run's markdown file
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_filename = os.path.join(OUTPUT_DIR, f"summary_{run_timestamp}.md")
     
     new_papers_added = 0
+    markdown_buffer = []
+
     for idx, paper in enumerate(papers):
-        print(f"Processing ({idx+1}/{len(papers)}): {paper['title']}")
-        paper_info = extract_paper_details(paper['url'])
-        summary_md = summarize_with_gemini(paper_info, paper['url'], paper['title'], paper['date'])
+        logger.info(f"Processing ({idx+1}/{len(papers)}): {paper['title']}")
         
-        added = update_markdown_file(summary_md)
-        if added:
-            new_papers_added += 1
+        if is_paper_processed(conn, paper['url']):
+            logger.info(f"Paper already processed, skipping: {paper['url']}")
+            continue
             
-    print(f"Done! Added {new_papers_added} new papers to the tracker.")
+        paper_info = extract_paper_details(paper['url'])
+        if not paper_info:
+            continue
+            
+        summary_md = summarize_with_gemini(paper_info, paper['url'], paper['title'], paper['date'])
+        if not summary_md:
+            continue
+            
+        markdown_buffer.append(summary_md)
+        record_paper_processed(conn, paper['url'], paper['title'], paper['date'], output_filename)
+        new_papers_added += 1
+
+    if markdown_buffer:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(output_filename, "w", encoding="utf-8") as f:
+            f.write(f"# NBER Innovation Policy Working Papers Tracker - Run {run_timestamp}\n\n")
+            f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("\n\n".join(markdown_buffer) + "\n\n")
+        logger.info(f"Saved {new_papers_added} summaries to {output_filename}")
+    else:
+        logger.info("No new summaries were generated during this run.")
+        
+    logger.info(f"Done! Processed {new_papers_added} new papers.")
+    conn.close()
 
 if __name__ == "__main__":
     main()
