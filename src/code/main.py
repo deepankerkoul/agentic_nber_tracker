@@ -7,6 +7,8 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 from google import genai
+from google.genai import errors
+import time
 
 # Add src to the path to allow absolute imports within the project if run from root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -190,15 +192,32 @@ Please extract the following information and output it EXACTLY in Markdown forma
 
 Ensure the output is valid Markdown.
 """
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        return response.text
-    except Exception as e:
-        logger.error(f"Failed to summarize paper using Gemini: {e}", exc_info=True)
-        return None
+    max_retries = 3
+    base_delay = 15
+    
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                # model='gemini-2.5-flash',
+                model='gemini-2.5-pro',
+                contents=prompt,
+            )
+            return response.text
+            
+        except errors.ClientError as e:
+            # If it's a 429 quota error, we back off and retry
+            if e.code == 429 and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # 15s, 30s...
+                logger.warning(f"Gemini API rate limit hit (429). Retrying in {delay} seconds... (Attempt {attempt+1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to summarize paper using Gemini: {e}", exc_info=True)
+                return None
+        except Exception as e:
+            logger.error(f"Failed to summarize paper using Gemini: {e}", exc_info=True)
+            return None
+            
+    return None
 
 def main():
     logger.info("Starting NBER Tracker script execution.")
@@ -216,7 +235,7 @@ def main():
     output_filename = os.path.join(OUTPUT_DIR, f"summary_{run_timestamp}.md")
     
     new_papers_added = 0
-    markdown_buffer = []
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     for idx, paper in enumerate(papers):
         logger.info(f"Processing ({idx+1}/{len(papers)}): {paper['title']}")
@@ -231,18 +250,21 @@ def main():
             
         summary_md = summarize_with_gemini(paper_info, paper['url'], paper['title'], paper['date'])
         if not summary_md:
+            # If rate limit exceeded maximum retries, it returns None.
+            # We skip writing and it will be retried in a future run since it's not marked as processed.
             continue
             
-        markdown_buffer.append(summary_md)
+        # Append to the file immediately
+        with open(output_filename, "a", encoding="utf-8") as f:
+            if new_papers_added == 0:
+                f.write(f"# NBER Innovation Policy Working Papers Tracker - Run {run_timestamp}\n\n")
+                f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(summary_md + "\n\n")
+
         record_paper_processed(conn, paper['url'], paper['title'], paper['date'], output_filename)
         new_papers_added += 1
 
-    if markdown_buffer:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        with open(output_filename, "w", encoding="utf-8") as f:
-            f.write(f"# NBER Innovation Policy Working Papers Tracker - Run {run_timestamp}\n\n")
-            f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            f.write("\n\n".join(markdown_buffer) + "\n\n")
+    if new_papers_added > 0:
         logger.info(f"Saved {new_papers_added} summaries to {output_filename}")
     else:
         logger.info("No new summaries were generated during this run.")
